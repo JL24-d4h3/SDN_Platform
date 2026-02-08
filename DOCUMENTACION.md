@@ -835,10 +835,182 @@ hostname -I
 
 ---
 
+---
+
+## 12. Sistema de Sesiones de Solicitud (Ciclo de Vida Completo)
+
+### Concepto
+
+El sistema de sesiones gestiona el **ciclo de vida completo** de una solicitud de contenido, desde que el celular presiona "buscar" hasta que recibe la respuesta y las radios se apagan.
+
+Esto resuelve el problema fundamental: **¿cuándo encender y apagar cada radio?**
+
+### Diagrama de flujo
+
+```
+Celular                     Controlador SDN               Gateway/Servidor
+  │                                │                                │
+  │  POST /sessions/request        │                                │
+  │  { originMac, query }          │                                │
+  │ ──────────────────────────────>│                                │
+  │                                │ Crea sesión (OUTBOUND)         │
+  │                                │ Decide: IDA por Bluetooth      │
+  │  <── MQTT: PREPARE_BT ────────│                                │
+  │                                │                                │
+  │  [Celular enciende BT]         │                                │
+  │  [Envía query por BT al nodo]  │                                │
+  │                                │                                │
+  │  POST /sessions/{id}/processing│                                │
+  │ ──────────────────────────────>│                                │
+  │                                │ Sesión → PROCESSING            │
+  │                                │                                │
+  │                                │  POST /sessions/{id}/response  │
+  │                                │  { contentType, responseSize } │
+  │                                │ <─────────────────────────────│
+  │                                │ Decide: VUELTA por WiFi        │
+  │  <── MQTT: SWITCH_WIFI ────────│  (respuesta es 50MB video)     │
+  │                                │                                │
+  │  [Celular enciende WiFi]       │                                │
+  │  [Recibe respuesta por WiFi]   │                                │
+  │                                │                                │
+  │  POST /sessions/{id}/delivered │                                │
+  │ ──────────────────────────────>│                                │
+  │                                │ Sesión → DELIVERED → CLOSED    │
+  │  <── MQTT: RELEASE_RADIO ─────│                                │
+  │                                │                                │
+  │  [Celular apaga BT y WiFi]    │                                │
+```
+
+### Estados de sesión
+
+| Estado      | Significado |
+|-------------|-------------|
+| `CREATED`   | Sesión creada, aún no se ha enviado comando. |
+| `OUTBOUND`  | Canal de ida decidido, comando PREPARE_BT enviado al celular. |
+| `PROCESSING`| La solicitud viaja por la red (nodo confirma recepción). |
+| `INBOUND`   | La respuesta está lista. Canal de vuelta decidido (BT o WiFi). |
+| `DELIVERED` | El celular confirmó que recibió la respuesta. |
+| `CLOSED`    | RELEASE_RADIO enviado. Radios apagadas. Sesión terminada. |
+
+### Canales de radio (RadioCarrier)
+
+| Canal       | Uso |
+|-------------|-----|
+| `BLUETOOTH` | Solicitudes ligeras, respuestas < 10 MB, texto/IA. |
+| `WIFI`      | Video, web, archivos >= 10 MB. |
+| `LORA`      | Señalización y control (futuro). |
+
+### Comandos MQTT (acciones del agente)
+
+| Acción          | Descripción |
+|-----------------|-------------|
+| `PREPARE_BT`    | Activar Bluetooth para enviar o recibir datos. |
+| `SWITCH_WIFI`   | Conectar a red WiFi (incluye SSID y contraseña). |
+| `RELEASE_RADIO` | Apagar la radio que fue activada para esta sesión. |
+
+### Endpoints REST de sesiones
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `POST` | `/sessions/request` | Iniciar una nueva solicitud |
+| `POST` | `/sessions/{id}/processing` | Marcar solicitud en tránsito |
+| `POST` | `/sessions/{id}/response` | Notificar que la respuesta está lista |
+| `POST` | `/sessions/{id}/delivered` | Confirmar entrega al dispositivo |
+| `GET`  | `/sessions/{id}` | Obtener detalle de una sesión |
+| `GET`  | `/sessions/active` | Listar sesiones activas |
+| `GET`  | `/sessions/device/{mac}/active` | Sesiones activas de un dispositivo |
+| `GET`  | `/sessions/device/{mac}` | Historial de sesiones de un dispositivo |
+
+### Ejemplo: Prueba completa con curl
+
+**Paso 1: Iniciar solicitud**
+```bash
+curl -X POST http://localhost:8081/sessions/request \
+  -H "Content-Type: application/json" \
+  -d '{
+    "originMac": "AA:BB:CC:DD:EE:FF",
+    "accessNodeMac": "11:22:33:44:55:66",
+    "query": "algoritmo de dijkstra",
+    "expectedContentType": "text"
+  }'
+```
+Respuesta: Sesión creada con `sessionId`, estado `OUTBOUND`, comando `PREPARE_BT` enviado por MQTT.
+
+**Paso 2: Marcar en processing (el nodo confirma)**
+```bash
+curl -X POST http://localhost:8081/sessions/abc12345/processing
+```
+
+**Paso 3: Respuesta lista (el gateway notifica)**
+```bash
+curl -X POST http://localhost:8081/sessions/abc12345/response \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sessionId": "abc12345",
+    "contentType": "video/mp4",
+    "responseSize": 52428800
+  }'
+```
+Respuesta: `inboundCarrier = WIFI`, comando `SWITCH_WIFI` enviado por MQTT.
+
+**Paso 4: Confirmar entrega (el celular confirma)**
+```bash
+curl -X POST http://localhost:8081/sessions/abc12345/delivered
+```
+Respuesta: Estado `CLOSED`, comando `RELEASE_RADIO` enviado a todos los dispositivos.
+
+**Paso 5: Ver historial completo**
+```bash
+curl http://localhost:8081/sessions/device/AA:BB:CC:DD:EE:FF
+```
+
+### Archivos del sistema de sesiones
+
+| Archivo | Descripción |
+|---------|-------------|
+| `model/RequestSession.kt` | Entidad JPA con estados, canales, timestamps |
+| `model/SessionDtos.kt` | DTOs: `ContentRequest` y `ResponseReady` |
+| `repository/SessionRepository.kt` | Queries JPA para sesiones |
+| `service/SessionService.kt` | Lógica del ciclo de vida: iniciar, procesar, decidir canal de vuelta, cerrar, liberar radios |
+| `controller/SessionController.kt` | API REST para gestionar sesiones |
+
+### Coexistencia con el endpoint legacy `/network/event`
+
+Ahora hay **dos formas** de usar el controlador:
+
+1. **`POST /network/event`** → Modo simple (sin sesión). Evalúa y envía un solo comando. No trackea ciclo de vida.
+2. **`POST /sessions/request`** → Modo completo (con sesión). Trackea todo el ciclo: IDA → PROCESAMIENTO → VUELTA → LIBERACIÓN.
+
+Para la tesis, el modo de sesiones es el recomendado porque permite medir tiempos de latencia, decisiones de canal, y uso de radio por sesión.
+
+### Ver sesiones en la base de datos H2
+
+En la consola H2 (`http://localhost:8081/h2-console`):
+
+```sql
+-- Ver todas las sesiones
+SELECT * FROM REQUEST_SESSIONS ORDER BY CREATED_AT DESC;
+
+-- Sesiones activas
+SELECT * FROM REQUEST_SESSIONS WHERE STATUS != 'CLOSED';
+
+-- Sesiones con su canal de ida vs. vuelta
+SELECT SESSION_ID, ORIGIN_MAC, OUTBOUND_CARRIER, INBOUND_CARRIER,
+       RESPONSE_SIZE, STATUS, CREATED_AT, CLOSED_AT
+FROM REQUEST_SESSIONS;
+
+-- Tiempo promedio de sesión
+SELECT AVG(DATEDIFF(SECOND, CREATED_AT, CLOSED_AT)) AS avg_seconds
+FROM REQUEST_SESSIONS WHERE CLOSED_AT IS NOT NULL;
+```
+
+---
+
 ## Resumen de lo que se logró
 
-Se implementó un **Controlador SDN completo con dispositivos reales** que:
+Se implementó un **Sistema SDN completo: Controlador + Agentes del Plano de Datos** que:
 
+### Plano de Control (Spring Boot — `src/`)
 1. **Registra dispositivos** en una base de datos H2 (manual o automáticamente)
 2. **Auto-descubre** dispositivos cuando envían telemetría MQTT
 3. **Recibe eventos de red** por REST (`POST /network/event`)
@@ -849,3 +1021,121 @@ Se implementó un **Controlador SDN completo con dispositivos reales** que:
 8. **Monitorea salud** de dispositivos (marca offline si no hay heartbeat en 2 min)
 9. **Expone API REST** para gestionar el inventario de dispositivos
 10. **Provee consola web H2** para inspeccionar la base de datos
+11. **Gestiona sesiones de solicitud** con ciclo de vida completo (CREATED → OUTBOUND → PROCESSING → INBOUND → DELIVERED → CLOSED)
+12. **Decide canal de ida y de vuelta** de forma independiente por sesión
+13. **Libera radios** automáticamente al confirmar entrega (RELEASE_RADIO)
+14. **Soporta 3 acciones MQTT**: PREPARE_BT, SWITCH_WIFI, RELEASE_RADIO
+
+### Plano de Datos — Agentes (`agents/`)
+15. **ESP32 (Arduino/C++)** — Agente básico con BT Classic + WiFi. Para pruebas rápidas.
+16. **Raspberry Pi (Python)** — Agente completo con rfkill/nmcli/bluetoothctl para manipular radios reales del sistema operativo.
+17. **LILYGO T-Lora C6 (Arduino/C++)** — Agente avanzado con BLE 5.0 Coded PHY (~100m), WiFi 6, y LoRa SX1262 (~15km).
+
+---
+
+## 13. Agentes del Plano de Datos
+
+### Arquitectura monorepo
+
+Los agentes viven en `agents/` junto al controlador Spring Boot. No interfieren
+con el build de Gradle porque cada uno tiene su propio sistema de build:
+
+```
+SDN_controller_app/
+├── src/                        ← Controlador SDN (Spring Boot / Gradle)
+├── agents/
+│   ├── esp32/                  ← Arduino IDE / PlatformIO
+│   │   ├── sdn_agent_esp32/
+│   │   │   ├── sdn_agent_esp32.ino
+│   │   │   └── config.h
+│   │   └── README.md
+│   ├── raspberry_pi/           ← Python 3 / pip
+│   │   ├── sdn_agent.py
+│   │   ├── config.py
+│   │   ├── requirements.txt
+│   │   └── README.md
+│   └── lilygo_t_lora_c6/      ← Arduino IDE / PlatformIO
+│       ├── sdn_agent_lilygo/
+│       │   ├── sdn_agent_lilygo.ino
+│       │   └── config.h
+│       └── README.md
+├── build.gradle.kts
+└── DOCUMENTACION.md
+```
+
+### Tabla comparativa de agentes
+
+| Característica     | ESP32 estándar    | Raspberry Pi     | LILYGO T-Lora C6     |
+|--------------------|-------------------|------------------|-----------------------|
+| **Lenguaje**       | C++ (Arduino)     | Python 3         | C++ (Arduino)         |
+| **WiFi**           | 802.11 b/g/n      | 2.4/5 GHz        | **802.11ax (WiFi 6)** |
+| **Bluetooth**      | Classic + BLE 4.2 | BT 5.0 (con RPi 4+) | **BLE 5.0 Coded PHY** |
+| **BT Alcance**     | ~10-30m           | ~10-30m (nativo) | **~100m+ (Coded S=8)**|
+| **LoRa**           | ✗                 | ✗                | **✓ SX1262 (~15 km)** |
+| **Control radios** | API Arduino       | rfkill/nmcli     | API Arduino + NimBLE  |
+| **Ideal para**     | Pruebas rápidas   | Nodo CDN/storage  | Nodo de acceso LR     |
+| **Disponible**     | ✓ Ahora           | ✓ Ahora          | Para futuro           |
+
+### Contrato MQTT (común a todos los agentes)
+
+Todos los agentes hablan el mismo "idioma" con el controlador:
+
+**Suscripción** (recibe comandos):
+```
+dispositivo/{MAC}/comando
+```
+
+**Publicación** (envía datos):
+```
+dispositivo/{MAC}/metrics    ← Telemetría periódica
+dispositivo/{MAC}/registro   ← Auto-registro al conectar
+```
+
+**Formato de comando** (recibido del controlador):
+```json
+{
+    "sessionId": "abc12345",
+    "action": "PREPARE_BT | SWITCH_WIFI | RELEASE_RADIO",
+    "ssid": "SDN_HIGH_SPEED",
+    "password": "sdn_secure_pass",
+    "reason": "Sesión abc12345: activar BT para enviar solicitud"
+}
+```
+
+**Formato de telemetría** (enviado al controlador):
+```json
+{
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "rssi": -45,
+    "technology": "bluetooth",
+    "batteryLevel": 85,
+    "ipAddress": "192.168.18.50"
+}
+```
+
+### Prueba rápida: ESP32 + Raspberry Pi + Controlador
+
+```bash
+# Terminal 1: Controlador SDN
+cd SDN_controller_app
+./gradlew bootRun
+
+# Terminal 2: Mosquitto (si no está corriendo)
+mosquitto -c mosquitto-lan.conf
+
+# Terminal 3 (en la Raspberry Pi): Agente Python
+cd agents/raspberry_pi
+pip install -r requirements.txt
+sudo python3 sdn_agent.py
+
+# Terminal 4: Flashear ESP32 desde Arduino IDE
+# Abrir agents/esp32/sdn_agent_esp32/sdn_agent_esp32.ino
+
+# Terminal 5: Probar sesión completa
+curl -X POST http://localhost:8081/sessions/request \
+  -H "Content-Type: application/json" \
+  -d '{"originMac":"AA:BB:CC:DD:EE:FF","query":"hola mundo","expectedContentType":"text"}'
+# → El controlador envía PREPARE_BT por MQTT
+# → El agente del ESP32 o RPi enciende Bluetooth
+# → El Serial Monitor / log muestra la ejecución
+```
