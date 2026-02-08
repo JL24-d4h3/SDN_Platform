@@ -83,7 +83,8 @@ class MqttConfig {
         val adapter = MqttPahoMessageDrivenChannelAdapter(
             "${clientId}-subscriber",
             mqttClientFactory(),
-            "dispositivo/+/metrics"
+            "dispositivo/+/metrics",
+            "dispositivo/+/registro"
         )
         adapter.setCompletionTimeout(5000)
         adapter.setConverter(DefaultPahoMessageConverter())

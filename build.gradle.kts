@@ -23,6 +23,10 @@ dependencies {
     // Spring Boot Starters
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-integration")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+
+    // Base de datos embebida H2 (no requiere instalación)
+    runtimeOnly("com.h2database:h2")
 
     // MQTT via Spring Integration
     implementation("org.springframework.integration:spring-integration-mqtt")

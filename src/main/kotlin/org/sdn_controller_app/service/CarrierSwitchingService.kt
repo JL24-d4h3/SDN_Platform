@@ -23,7 +23,8 @@ import org.springframework.stereotype.Service
 @Service
 class CarrierSwitchingService(
     private val mqttGateway: MqttGateway,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val deviceService: DeviceService
 ) {
 
     private val log = LoggerFactory.getLogger(CarrierSwitchingService::class.java)
@@ -57,12 +58,23 @@ class CarrierSwitchingService(
      * @return El comando generado con la acción decidida.
      */
     fun evaluateAndDispatch(request: NetworkEventRequest): CarrierCommand {
+        val mac = request.deviceMac.uppercase().trim()
+
+        // ── Verificar si el dispositivo está registrado ──
+        val device = deviceService.findByMac(mac)
+        if (device == null) {
+            log.warn("⚠ Dispositivo NO registrado: {}. Se procesará pero se recomienda registrar.", mac)
+        } else {
+            log.info("✓ Dispositivo conocido: {} ({}) — online={}, tech={}",
+                device.mac, device.name, device.online, device.activeTechnology)
+        }
+
         val command = decide(request)
-        val topic = "dispositivo/${request.deviceMac}/comando"
+        val topic = "dispositivo/${mac}/comando"
         val json = objectMapper.writeValueAsString(command)
 
         log.info("──── Carrier Switching Decision ─────────────────────")
-        log.info("  Device  : {}", request.deviceMac)
+        log.info("  Device  : {} {}", mac, if (device != null) "(${device.name})" else "(no registrado)")
         log.info("  Content : {} ({} bytes)", request.contentType, request.fileSize)
         log.info("  Action  : {}", command.action)
         log.info("  Topic   : {}", topic)
